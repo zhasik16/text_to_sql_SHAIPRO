@@ -16,6 +16,7 @@ import numpy as np
 from tabulate import tabulate
 import random
 
+from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler, ConversationHandler
 
@@ -26,9 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+load_dotenv()
 # Configuration - UPDATE THESE WITH YOUR KEYS!
-OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', "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")
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "8072826990:AAGtiAIC5xgMxL9g2aUCRqkF7BAyl-tELGU")
+OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Conversation states
@@ -96,7 +98,9 @@ LANGUAGES = {
         'showing_all_data': "📋 Showing all data ({} records):",
         'showing_sample': "📋 Showing sample of data ({} records):",
         'voice_processing': "🎤 Processing your voice message...",
-        'voice_transcribed': "🎤 Voice transcribed: '{}'"
+        'voice_transcribed': "🎤 Voice transcribed: '{}'",
+        'table_info': "📊 Table: {} ({} columns, {} rows)",
+        'language_changed': "🌐 Language changed to English"
     },
     'ru': {
         'welcome': "🚀 *Продвинутый Text-to-SQL Ассистент*\n\nЯ помогу вам работать с базами данных на естественном языке!",
@@ -155,7 +159,9 @@ LANGUAGES = {
         'showing_all_data': "📋 Показаны все данные ({} записей):",
         'showing_sample': "📋 Показана выборка данных ({} записей):",
         'voice_processing': "🎤 Обрабатываю ваше голосовое сообщение...",
-        'voice_transcribed': "🎤 Голос расшифрован: '{}'"
+        'voice_transcribed': "🎤 Голос расшифрован: '{}'",
+        'table_info': "📊 Таблица: {} ({} столбцов, {} строк)",
+        'language_changed': "🌐 Язык изменен на Русский"
     }
 }
 
@@ -165,6 +171,7 @@ class UserState:
         self.mode = None
         self.current_db = None
         self.current_db_name = None
+        self.current_table = None  # Store the actual table name
         self.creating_db_name = None
         self.creating_db_columns = []
         self.waiting_for_column_def = False
@@ -175,7 +182,7 @@ def init_bot_database():
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS user_databases
-                 (user_id INTEGER, db_name TEXT, db_path TEXT, columns TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                 (user_id INTEGER, db_name TEXT, db_path TEXT, table_name TEXT, columns TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_settings
                  (user_id INTEGER PRIMARY KEY, language TEXT DEFAULT 'en')''')
     conn.commit()
@@ -189,7 +196,7 @@ def get_user_language(user_id):
     c.execute("SELECT language FROM user_settings WHERE user_id=?", (user_id,))
     result = c.fetchone()
     conn.close()
-    return result[0] if result else None
+    return result[0] if result else 'en'
 
 def save_user_language(user_id, language):
     conn = sqlite3.connect('bot_data.db')
@@ -202,23 +209,69 @@ def save_user_language(user_id, language):
 def get_user_databases(user_id):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute("SELECT db_name, db_path FROM user_databases WHERE user_id=? ORDER BY created_at DESC", (user_id,))
+    c.execute("SELECT db_name, db_path, table_name FROM user_databases WHERE user_id=? ORDER BY created_at DESC", (user_id,))
     dbs = c.fetchall()
     conn.close()
     return dbs
 
-def save_user_database(user_id, db_name, db_path, columns):
+def save_user_database(user_id, db_name, db_path, table_name, columns):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
-    c.execute("INSERT INTO user_databases (user_id, db_name, db_path, columns) VALUES (?, ?, ?, ?)",
-              (user_id, db_name, db_path, json.dumps(columns)))
+    c.execute("INSERT INTO user_databases (user_id, db_name, db_path, table_name, columns) VALUES (?, ?, ?, ?, ?)",
+              (user_id, db_name, db_path, table_name, json.dumps(columns)))
     conn.commit()
     conn.close()
+
+def get_database_info(db_path):
+    """Get information about the database including table names and structure"""
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        # Get all tables
+        c.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        tables = c.fetchall()
+        
+        table_info = {}
+        for table in tables:
+            table_name = table[0]
+            c.execute(f"PRAGMA table_info({table_name})")
+            columns = c.fetchall()
+            c.execute(f"SELECT COUNT(*) FROM {table_name}")
+            row_count = c.fetchone()[0]
+            
+            table_info[table_name] = {
+                'columns': [col[1] for col in columns],
+                'row_count': row_count
+            }
+        
+        conn.close()
+        return table_info
+        
+    except Exception as e:
+        logger.error(f"Error getting database info: {e}")
+        return {}
+
+def detect_main_table(table_info):
+    """Detect the main table to use for queries"""
+    if not table_info:
+        return None
+    
+    # Prefer tables with more rows
+    tables_by_size = sorted(table_info.items(), key=lambda x: x[1]['row_count'], reverse=True)
+    
+    # Avoid system tables
+    for table_name, info in tables_by_size:
+        if not table_name.startswith('sqlite_'):
+            return table_name
+    
+    # Fallback to first table
+    return list(table_info.keys())[0] if table_info else None
 
 # Enhanced OpenRouter API call function with better error handling
 def call_openrouter(prompt, model="google/gemini-pro", max_tokens=1000, temperature=0.1):
     # Check if API key is set
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.startswith("your-"):
+    if not OPENROUTER_API_KEY:
         logger.error("OpenRouter API key not configured properly")
         return None
     
@@ -242,7 +295,9 @@ def call_openrouter(prompt, model="google/gemini-pro", max_tokens=1000, temperat
         result = response.json()
         return result['choices'][0]['message']['content']
     except requests.exceptions.HTTPError as e:
-        if response.status_code == 401:
+        if response.status_code == 400:
+            logger.error("OpenRouter API: Bad Request - Prompt might be too long or malformed")
+        elif response.status_code == 401:
             logger.error("OpenRouter API: Unauthorized - Check your API key")
         elif response.status_code == 429:
             logger.error("OpenRouter API: Rate limit exceeded")
@@ -256,8 +311,8 @@ def call_openrouter(prompt, model="google/gemini-pro", max_tokens=1000, temperat
         logger.error(f"OpenRouter API Unexpected Error: {e}")
         return None
 
-# Enhanced SQL generator with better table display
-def generate_sql_with_visualization(schema_info, query_text, language='en'):
+# Enhanced SQL generator with better table detection
+def generate_sql_with_visualization(schema_info, query_text, table_name, language='en'):
     """Generate SQL with special handling for table display requests"""
     query_lower = query_text.lower()
     lang_dict = LANGUAGES[language]
@@ -267,14 +322,14 @@ def generate_sql_with_visualization(schema_info, query_text, language='en'):
                          'показать всю', 'отобразить все', 'вся таблица', 'полная таблица']
     
     if any(keyword in query_lower for keyword in show_all_keywords):
-        return "SELECT * FROM data", "full_table"
+        return f"SELECT * FROM {table_name}", "full_table"
     
     # Handle requests with limits
     if any(word in query_lower for word in ['first', 'top', 'первые', 'топ']):
         limit_match = re.search(r'(first|top|первые|топ)\s+(\d+)', query_lower)
         if limit_match:
             limit = limit_match.group(2)
-            return f"SELECT * FROM data LIMIT {limit}", "limited_table"
+            return f"SELECT * FROM {table_name} LIMIT {limit}", "limited_table"
     
     # Use OpenRouter for complex queries
     prompt = f"""
@@ -282,14 +337,16 @@ def generate_sql_with_visualization(schema_info, query_text, language='en'):
     {schema_info}
     
     Based on the above schema, generate an SQL query for: {query_text}
+    Use table name: {table_name}
     
     Return only the SQL query without any explanation.
+    Keep the query simple and avoid complex joins unless necessary.
     """
     
     sql_query = call_openrouter(prompt)
     if not sql_query:
         # Fallback to simple query
-        return "SELECT * FROM data LIMIT 10", "fallback"
+        return f"SELECT * FROM {table_name} LIMIT 10", "fallback"
     
     # Clean up the SQL query
     if sql_query.startswith("```sql"):
@@ -299,10 +356,14 @@ def generate_sql_with_visualization(schema_info, query_text, language='en'):
     if sql_query.endswith("```"):
         sql_query = sql_query[:-3]
     
+    # Ensure the query uses the correct table name
+    sql_query = sql_query.replace('FROM data', f'FROM {table_name}')
+    sql_query = sql_query.replace('from data', f'from {table_name}')
+    
     return sql_query.strip(), "ai_generated"
 
 # Enhanced visualization with beautiful table formatting
-def create_enhanced_visualization(df, query_type, language='en'):
+def create_enhanced_visualization(df, query_type, table_name, language='en'):
     try:
         lang_dict = LANGUAGES[language]
         
@@ -432,11 +493,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
     # Initialize user state
-    USER_STATES[user_id] = UserState()
+    if user_id not in USER_STATES:
+        USER_STATES[user_id] = UserState()
     
     # Check if user already has a language preference
     user_language = get_user_language(user_id)
-    if user_language:
+    if user_language and user_language in LANGUAGES:
         USER_STATES[user_id].language = user_language
         await show_main_menu(update, context, user_language)
         return MAIN_MENU
@@ -544,7 +606,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang_dict = LANGUAGES[language]
     
     # Check if API key is configured
-    if not OPENROUTER_API_KEY or OPENROUTER_API_KEY.startswith("your-"):
+    if not OPENROUTER_API_KEY:
         help_text = lang_dict['help_text'] + "\n\n" + lang_dict['api_error_help']
     else:
         help_text = lang_dict['help_text']
@@ -568,6 +630,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     await update.message.reply_text(lang_dict['settings_text'], reply_markup=reply_markup, parse_mode='Markdown')
+    return MAIN_MENU
 
 async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -624,40 +687,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 df = pd.read_excel(user_state.current_db)
             
             conn = sqlite3.connect(db_path)
-            df.to_sql('data', conn, if_exists='replace', index=False)
+            # Use the original file name as table name (sanitized)
+            table_name = re.sub(r'[^a-zA-Z0-9_]', '_', file_name.split('.')[0])
+            if not table_name:
+                table_name = "data"
+            
+            df.to_sql(table_name, conn, if_exists='replace', index=False)
             conn.close()
             
             user_state.current_db = db_path
+            user_state.current_table = table_name
             
             # Get record count for message
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM data")
+            c.execute(f"SELECT COUNT(*) FROM {table_name}")
             count = c.fetchone()[0]
             conn.close()
             
-            record_info = f"{count} records"
+            record_info = f"{count} records in table '{table_name}'"
             
         except Exception as e:
             logger.error(f"Error processing file: {e}")
             await update.message.reply_text(f"Error processing file: {e}")
             return
     else:
-        # For SQLite databases, just count records
+        # For SQLite databases, detect the main table
         try:
+            table_info = get_database_info(user_state.current_db)
+            if not table_info:
+                await update.message.reply_text("No tables found in the database.")
+                return
+                
+            main_table = detect_main_table(table_info)
+            user_state.current_table = main_table
+            
             conn = sqlite3.connect(user_state.current_db)
             c = conn.cursor()
-            c.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = c.fetchall()
-            
-            if tables:
-                c.execute(f"SELECT COUNT(*) FROM {tables[0][0]}")
-                count = c.fetchone()[0]
-                record_info = f"{count} records in {tables[0][0]}"
-            else:
-                record_info = "No tables found"
-                
+            c.execute(f"SELECT COUNT(*) FROM {main_table}")
+            count = c.fetchone()[0]
             conn.close()
+            
+            record_info = f"{count} records in table '{main_table}'"
+            
         except Exception as e:
             logger.error(f"Error reading SQLite database: {e}")
             record_info = "Database loaded"
@@ -666,6 +738,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lang_dict['db_uploaded'].format(file_name, record_info),
         parse_mode='Markdown'
     )
+    
+    # Show table information
+    table_info = get_database_info(user_state.current_db)
+    if table_info and user_state.current_table in table_info:
+        info = table_info[user_state.current_table]
+        await update.message.reply_text(
+            lang_dict['table_info'].format(user_state.current_table, len(info['columns']), info['row_count']),
+            parse_mode='Markdown'
+        )
     
     # Ask for query
     keyboard = [
@@ -740,7 +821,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         await show_main_menu(update, context, language)
         return MAIN_MENU
     
-    if not user_state.current_db:
+    if not user_state.current_db or not user_state.current_table:
         await update.message.reply_text(lang_dict['no_db_selected'])
         return
     
@@ -753,20 +834,17 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         c = conn.cursor()
         
         # Get table info
-        c.execute("SELECT name FROM sqlite_master WHERE type='table';")
-        tables = c.fetchall()
+        c.execute(f"PRAGMA table_info({user_state.current_table})")
+        columns = c.fetchall()
         
-        schema_info = ""
-        for table in tables:
-            table_name = table[0]
-            c.execute(f"PRAGMA table_info({table_name})")
-            columns = c.fetchall()
-            schema_info += f"Table {table_name}: {', '.join([col[1] for col in columns])}\n"
+        schema_info = f"Table {user_state.current_table}: {', '.join([col[1] for col in columns])}\n"
         
         conn.close()
         
         # Generate SQL query with visualization type
-        sql_query, query_type = generate_sql_with_visualization(schema_info, text, language)
+        sql_query, query_type = generate_sql_with_visualization(
+            schema_info, text, user_state.current_table, language
+        )
         
         # Execute the query
         conn = sqlite3.connect(user_state.current_db)
@@ -778,7 +856,7 @@ async def process_query(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             await processing_msg.edit_text(lang_dict['no_results'])
         else:
             # Create enhanced visualization
-            visualization = create_enhanced_visualization(df, query_type, language)
+            visualization = create_enhanced_visualization(df, query_type, user_state.current_table, language)
             
             if isinstance(visualization, dict):
                 # We have a chart to send
@@ -913,10 +991,11 @@ async def process_column_definition(update: Update, context: ContextTypes.DEFAUL
         conn.close()
         
         # Store database info
-        save_user_database(user_id, db_name, db_path, columns)
+        save_user_database(user_id, db_name, db_path, "data", columns)
         
         user_state.current_db = db_path
         user_state.current_db_name = db_name
+        user_state.current_table = "data"
         user_state.waiting_for_column_def = False
         
         await processing_msg.edit_text(
@@ -1026,7 +1105,7 @@ async def process_data_addition(update: Update, context: ContextTypes.DEFAULT_TY
             conn = sqlite3.connect(user_state.current_db)
             c = conn.cursor()
             placeholders = ", ".join(["?" for _ in columns])
-            c.execute(f"INSERT INTO data VALUES ({placeholders})", values)
+            c.execute(f"INSERT INTO {user_state.current_table} VALUES ({placeholders})", values)
             conn.commit()
             conn.close()
             
@@ -1078,6 +1157,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if db_index < len(dbs):
             user_state.current_db = dbs[db_index][1]
             user_state.current_db_name = dbs[db_index][0]
+            # Get the table name for this database
+            conn = sqlite3.connect('bot_data.db')
+            c = conn.cursor()
+            c.execute("SELECT table_name FROM user_databases WHERE user_id=? AND db_path=?", 
+                     (user_id, user_state.current_db))
+            table_name = c.fetchone()[0]
+            conn.close()
+            
+            user_state.current_table = table_name
             await query.edit_message_text(f"Selected database: {dbs[db_index][0]}. You can now add data.")
         else:
             await query.edit_message_text("Database selection failed.")
@@ -1096,6 +1184,26 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
     
     return MAIN_MENU
+
+async def change_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id not in USER_STATES:
+        USER_STATES[user_id] = UserState()
+    
+    # Language selection keyboard
+    keyboard = [
+        [KeyboardButton("English 🇺🇸"), KeyboardButton("Русский 🇷🇺")],
+        [KeyboardButton(LANGUAGES[USER_STATES[user_id].language]['back_button'])]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "🌐 Select your preferred language:",
+        reply_markup=reply_markup
+    )
+    
+    return LANGUAGE
 
 # Error handler
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1133,7 +1241,8 @@ def main():
                 CommandHandler('help', help_command),
                 CommandHandler('settings', settings_command),
                 CommandHandler('list', list_databases),
-                CommandHandler('cancel', cancel)
+                CommandHandler('cancel', cancel),
+                CommandHandler('language', change_language)
             ],
             TEXT_TO_SQL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_query),
